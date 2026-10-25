@@ -510,22 +510,19 @@ def run_reject_simulation_and_record(output_mp4: str = "PAI最終課題_47412_re
                 ("7. Release & Retreat", p_release, p_retreat, 35, "open", 0.0, False),
             ]
         else:
-            # 2nd Cube (RED): Pick up -> Move to Bin #2 (YELLOW) to inspect -> REJECT -> Return to original Slot #2 & place back!
-            p_inspect_bin = np.array([bin_xy[0], bin_xy[1], 0.22], dtype=np.float32)
-            p_return_above = np.array([pick_xy[0], pick_xy[1], 0.28], dtype=np.float32)
-            p_return_place = np.array([pick_xy[0], pick_xy[1], 0.138], dtype=np.float32)
+            # 2nd Cube (RED): Overhead camera detects NO matching RED bin (Bin #2 is YELLOW).
+            # Lift RED cube above Slot #2 -> Reject placement -> Lower straight back down to original Slot #2!
+            p_return_place = np.array([pick_xy[0], pick_xy[1], 0.135], dtype=np.float32)
             p_return_retreat = np.array([pick_xy[0], pick_xy[1], 0.28], dtype=np.float32)
 
             subphases = [
-                ("1. Approach Slot #2 (RED)", current_ee_pos, p_above_pick, 35, "open", 0.05, False),
-                ("2. Pre-Grasp Descent", p_above_pick, p_grasp, 30, "open", 0.0, False),
-                ("3. Force-Closure Grasp", p_grasp, p_grasp, 30, "close", 0.0, False),
-                ("4. Lift RED Cube", p_grasp, p_lift, 25, "close", 0.0, False),
-                ("5. Inspect Bin #2 (YELLOW)", p_lift, p_inspect_bin, 45, "close", 0.05, True),
-                ("6. [REJECT] Bin#2=YELLOW != RED", p_inspect_bin, p_inspect_bin, 25, "close", 0.0, True),
-                ("7. Return RED Cube to Slot #2", p_inspect_bin, p_return_above, 40, "close", 0.06, True),
-                ("8. Place Back at Original Slot #2", p_return_above, p_return_place, 25, "close", 0.0, True),
-                ("9. Release at Origin & Retreat", p_return_place, p_return_retreat, 25, "open", 0.0, False),
+                ("1. Approach Slot #2 (RED)", current_ee_pos, p_above_pick, 50, "open", 0.06, False),
+                ("2. Pre-Grasp Descent", p_above_pick, p_grasp, 40, "open", 0.0, False),
+                ("3. Force-Closure Grasp", p_grasp, p_grasp, 35, "close", 0.0, False),
+                ("4. Vertical Lift RED Cube", p_grasp, p_lift, 45, "close", 0.0, False),
+                ("5. [REJECT] No RED Bin (Bin#2=YELLOW)", p_lift, p_lift, 40, "close", 0.0, True),
+                ("6. Lower Back to Original Slot #2", p_lift, p_return_place, 35, "close", 0.0, True),
+                ("7. Release at Origin & Retreat", p_return_place, p_return_retreat, 35, "open", 0.0, False),
             ]
 
         for sub_name, start_p, goal_p, n_steps, gripper_mode, arch_h, alert_flag in subphases:
