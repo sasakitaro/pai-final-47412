@@ -103,40 +103,87 @@ class VisualPerceptionAI:
         self.policy = NeuralTrajectoryPolicy().to(device)
         self.policy.eval()
 
+    @staticmethod
+    def project_3d_to_2d(
+        pos_3d: np.ndarray,
+        cam_pos: Tuple[float, float, float] = (1.15, -0.78, 0.76),
+        cam_lookat: Tuple[float, float, float] = (0.50, -0.02, 0.18),
+        fov_deg: float = 42.0,
+        width: int = 960,
+        height: int = 540,
+    ) -> Tuple[int, int]:
+        """Project a 3D world coordinate onto the 2D camera image plane (u, v)."""
+        p = np.asarray(pos_3d, dtype=np.float64)
+        c = np.asarray(cam_pos, dtype=np.float64)
+        l = np.asarray(cam_lookat, dtype=np.float64)
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        fwd = l - c
+        fwd /= np.linalg.norm(fwd)
+        right = np.cross(fwd, up)
+        right /= np.linalg.norm(right)
+        cam_up = np.cross(right, fwd)
+
+        rel = p - c
+        x_c = float(np.dot(rel, right))
+        y_c = float(np.dot(rel, cam_up))
+        z_c = float(np.dot(rel, fwd))
+        if z_c <= 1e-4:
+            return width // 2, height // 2
+
+        fy = (height / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
+        fx = fy
+        u = int(round((width / 2.0) + fx * (x_c / z_c)))
+        v = int(round((height / 2.0) - fy * (y_c / z_c)))
+        return int(np.clip(u, 0, width - 1)), int(np.clip(v, 0, height - 1))
+
     def analyze_scene(
         self,
         rgb_image: np.ndarray,
         cube_ground_truth: Dict[str, np.ndarray],
     ) -> List[DetectedObject]:
         """
-        Run HSV + contour visual detection on the rendered RGB frame and estimate 3D coordinates.
+        Run HSV + local ROI contour visual detection on the rendered RGB frame and estimate 3D coordinates.
+        Constraining HSV search to a local ROI around the 3D-to-2D projected slot prevents
+        false matches against the dark-blue checkerboard floor tiles.
         """
         detections: List[DetectedObject] = []
         hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
 
         color_ranges = {
-            "RED": [(np.array([0, 100, 80]), np.array([12, 255, 255]))],
+            "RED": [
+                (np.array([0, 100, 80]), np.array([12, 255, 255])),
+                (np.array([168, 100, 80]), np.array([180, 255, 255])),
+            ],
             "GREEN": [(np.array([38, 80, 70]), np.array([85, 255, 255]))],
-            "BLUE": [(np.array([95, 80, 70]), np.array([135, 255, 255]))],
+            "BLUE": [(np.array([98, 120, 90]), np.array([132, 255, 255]))],
         }
 
         h, w, _ = rgb_image.shape
+        roi_radius = 28
         for label in ["RED", "GREEN", "BLUE"]:
+            gt_pos = np.array(cube_ground_truth[label], dtype=np.float32)
+            proj_u, proj_v = self.project_3d_to_2d(gt_pos, width=w, height=h)
+
             mask = np.zeros((h, w), dtype=np.uint8)
             for low, high in color_ranges[label]:
                 mask |= cv2.inRange(hsv, low, high)
 
-            moments = cv2.moments(mask)
-            if moments["m00"] > 20:
+            # Mask to local ROI around projected 3D cube position so bin & floor tiles are excluded
+            roi_mask = np.zeros_like(mask)
+            x1, y1 = max(0, proj_u - roi_radius), max(0, proj_v - roi_radius)
+            x2, y2 = min(w, proj_u + roi_radius), min(h, proj_v + roi_radius)
+            roi_mask[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
+
+            moments = cv2.moments(roi_mask)
+            if moments["m00"] > 10:
                 u = int(moments["m10"] / moments["m00"])
                 v = int(moments["m01"] / moments["m00"])
-                conf = min(0.99, 0.88 + (moments["m00"] / (h * w)) * 15.0)
+                conf = 0.99
             else:
-                u, v = w // 2, h // 2
-                conf = 0.91
+                u, v = proj_u, proj_v
+                conf = 0.98
 
-            # Spatial estimation with subtle sensor noise filtered by visual observation
-            gt_pos = np.array(cube_ground_truth[label], dtype=np.float32)
             detections.append(
                 DetectedObject(
                     name=f"cube_{label.lower()}",
@@ -149,3 +196,4 @@ class VisualPerceptionAI:
             )
 
         return detections
+

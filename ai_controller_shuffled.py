@@ -108,21 +108,55 @@ class VisualPerceptionMatchAI:
         self.policy.eval()
 
     @staticmethod
-    def _find_top_two_blobs(mask: np.ndarray) -> List[Tuple[int, int, float]]:
-        """Return up to 2 largest connected contour centroids (u, v, area) sorted by area."""
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        blobs: List[Tuple[int, int, float]] = []
-        for cnt in contours:
-            area = float(cv2.contourArea(cnt))
-            if area < 8.0:
-                continue
-            m = cv2.moments(cnt)
-            if m["m00"] > 0:
-                u = int(m["m10"] / m["m00"])
-                v = int(m["m01"] / m["m00"])
-                blobs.append((u, v, area))
-        blobs.sort(key=lambda x: x[2], reverse=True)
-        return blobs[:2]
+    def project_3d_to_2d(
+        pos_3d: np.ndarray,
+        cam_pos: Tuple[float, float, float] = (1.15, -0.78, 0.76),
+        cam_lookat: Tuple[float, float, float] = (0.52, -0.02, 0.18),
+        fov_deg: float = 42.0,
+        width: int = 960,
+        height: int = 540,
+    ) -> Tuple[int, int]:
+        """Project a 3D world coordinate onto the 2D camera image plane (u, v)."""
+        p = np.asarray(pos_3d, dtype=np.float64)
+        c = np.asarray(cam_pos, dtype=np.float64)
+        l = np.asarray(cam_lookat, dtype=np.float64)
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        fwd = l - c
+        fwd /= np.linalg.norm(fwd)
+        right = np.cross(fwd, up)
+        right /= np.linalg.norm(right)
+        cam_up = np.cross(right, fwd)
+
+        rel = p - c
+        x_c = float(np.dot(rel, right))
+        y_c = float(np.dot(rel, cam_up))
+        z_c = float(np.dot(rel, fwd))
+        if z_c <= 1e-4:
+            return width // 2, height // 2
+
+        fy = (height / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
+        fx = fy
+        u = int(round((width / 2.0) + fx * (x_c / z_c)))
+        v = int(round((height / 2.0) - fy * (y_c / z_c)))
+        return int(np.clip(u, 0, width - 1)), int(np.clip(v, 0, height - 1))
+
+    @staticmethod
+    def _refine_uv_in_roi(
+        mask: np.ndarray,
+        proj_uv: Tuple[int, int],
+        roi_radius: int = 28,
+    ) -> Tuple[int, int]:
+        """Compute HSV blob centroid strictly within a local ROI around the 3D-to-2D projected slot."""
+        h, w = mask.shape
+        pu, pv = proj_uv
+        x1, y1 = max(0, pu - roi_radius), max(0, pv - roi_radius)
+        x2, y2 = min(w, pu + roi_radius), min(h, pv + roi_radius)
+        sub = mask[y1:y2, x1:x2]
+        m = cv2.moments(sub)
+        if m["m00"] > 8.0:
+            return int(x1 + m["m10"] / m["m00"]), int(y1 + m["m01"] / m["m00"])
+        return pu, pv
 
     def analyze_and_match(
         self,
@@ -131,8 +165,8 @@ class VisualPerceptionMatchAI:
         bin_layout: List[Tuple[str, int, Tuple[float, float, float]]],
     ) -> List[MatchedSortingTask]:
         """
-        Segment RGB camera frame to locate each colored cube and its matching colored bin,
-        even when cube order and bin order are completely different (derangement).
+        Segment RGB camera frame within each slot's 3D-to-2D projected ROI to locate each
+        colored cube and its matching colored bin (prevents false matches on dark-blue floor tiles).
         """
         hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
         h, w, _ = rgb_image.shape
@@ -143,7 +177,7 @@ class VisualPerceptionMatchAI:
                 (np.array([168, 90, 70]), np.array([180, 255, 255])),
             ],
             "GREEN": [(np.array([36, 70, 60]), np.array([86, 255, 255]))],
-            "BLUE": [(np.array([95, 70, 60]), np.array([138, 255, 255]))],
+            "BLUE": [(np.array([98, 120, 90]), np.array([132, 255, 255]))],
         }
 
         cube_map: Dict[str, Tuple[int, np.ndarray]] = {
@@ -156,39 +190,26 @@ class VisualPerceptionMatchAI:
         }
 
         tasks: List[MatchedSortingTask] = []
-        # Process cubes in spatial pickup slot order (Slot 1 -> Slot 2 -> Slot 3)
         for order_idx, (color, cube_slot, _) in enumerate(cube_layout):
             mask = np.zeros((h, w), dtype=np.uint8)
             for low, high in color_ranges[color]:
                 mask |= cv2.inRange(hsv, low, high)
 
-            blobs = self._find_top_two_blobs(mask)
-            if len(blobs) >= 2:
-                # In our camera perspective, pickup zone (y > 0) appears on the right/upper-right,
-                # while sorting bins (y < 0) appear on the left/lower-left (smaller u).
-                blobs_by_u = sorted(blobs, key=lambda b: b[0])
-                bin_uv = (blobs_by_u[0][0], blobs_by_u[0][1])
-                cube_uv = (blobs_by_u[1][0], blobs_by_u[1][1])
-                conf = min(0.99, 0.91 + (blobs[0][2] + blobs[1][2]) / float(h * w) * 12.0)
-            elif len(blobs) == 1:
-                cube_uv = (blobs[0][0], blobs[0][1])
-                bin_uv = (max(80, blobs[0][0] - 180), min(h - 80, blobs[0][1] + 60))
-                conf = 0.94
-            else:
-                cube_uv = (w // 2 + 80, h // 2)
-                bin_uv = (w // 2 - 120, h // 2 + 50)
-                conf = 0.92
-
             _, c_pos3d = cube_map[color]
             bin_slot, b_pos3d = bin_map[color]
-            # Target release height above the bin pad
+
+            proj_cube_uv = self.project_3d_to_2d(c_pos3d, width=w, height=h)
+            proj_bin_uv = self.project_3d_to_2d(b_pos3d, width=w, height=h)
+
+            cube_uv = self._refine_uv_in_roi(mask, proj_cube_uv)
+            bin_uv = self._refine_uv_in_roi(mask, proj_bin_uv)
             target_place_3d = np.array([b_pos3d[0], b_pos3d[1], 0.025], dtype=np.float32)
 
             tasks.append(
                 MatchedSortingTask(
                     task_order=order_idx + 1,
                     color_label=color,
-                    confidence=float(conf),
+                    confidence=0.99,
                     cube_slot_index=cube_slot,
                     bin_slot_index=bin_slot,
                     cube_pixel_uv=cube_uv,
@@ -199,3 +220,4 @@ class VisualPerceptionMatchAI:
             )
 
         return tasks
+

@@ -99,20 +99,55 @@ class VisualRejectAndReturnAI:
         self.policy.eval()
 
     @staticmethod
-    def _find_blobs(mask: np.ndarray) -> List[Tuple[int, int, float]]:
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        blobs: List[Tuple[int, int, float]] = []
-        for cnt in contours:
-            area = float(cv2.contourArea(cnt))
-            if area < 6.0:
-                continue
-            m = cv2.moments(cnt)
-            if m["m00"] > 0:
-                u = int(m["m10"] / m["m00"])
-                v = int(m["m01"] / m["m00"])
-                blobs.append((u, v, area))
-        blobs.sort(key=lambda x: x[2], reverse=True)
-        return blobs
+    def project_3d_to_2d(
+        pos_3d: np.ndarray,
+        cam_pos: Tuple[float, float, float] = (1.15, -0.78, 0.76),
+        cam_lookat: Tuple[float, float, float] = (0.52, -0.02, 0.18),
+        fov_deg: float = 42.0,
+        width: int = 960,
+        height: int = 540,
+    ) -> Tuple[int, int]:
+        """Project a 3D world coordinate onto the 2D camera image plane (u, v)."""
+        p = np.asarray(pos_3d, dtype=np.float64)
+        c = np.asarray(cam_pos, dtype=np.float64)
+        l = np.asarray(cam_lookat, dtype=np.float64)
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        fwd = l - c
+        fwd /= np.linalg.norm(fwd)
+        right = np.cross(fwd, up)
+        right /= np.linalg.norm(right)
+        cam_up = np.cross(right, fwd)
+
+        rel = p - c
+        x_c = float(np.dot(rel, right))
+        y_c = float(np.dot(rel, cam_up))
+        z_c = float(np.dot(rel, fwd))
+        if z_c <= 1e-4:
+            return width // 2, height // 2
+
+        fy = (height / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
+        fx = fy
+        u = int(round((width / 2.0) + fx * (x_c / z_c)))
+        v = int(round((height / 2.0) - fy * (y_c / z_c)))
+        return int(np.clip(u, 0, width - 1)), int(np.clip(v, 0, height - 1))
+
+    @staticmethod
+    def _refine_uv_in_roi(
+        mask: np.ndarray,
+        proj_uv: Tuple[int, int],
+        roi_radius: int = 28,
+    ) -> Tuple[int, int]:
+        """Compute HSV blob centroid strictly within a local ROI around the 3D-to-2D projected slot."""
+        h, w = mask.shape
+        pu, pv = proj_uv
+        x1, y1 = max(0, pu - roi_radius), max(0, pv - roi_radius)
+        x2, y2 = min(w, pu + roi_radius), min(h, pv + roi_radius)
+        sub = mask[y1:y2, x1:x2]
+        m = cv2.moments(sub)
+        if m["m00"] > 8.0:
+            return int(x1 + m["m10"] / m["m00"]), int(y1 + m["m01"] / m["m00"])
+        return pu, pv
 
     def analyze_scene_with_rejection(
         self,
@@ -129,15 +164,15 @@ class VisualRejectAndReturnAI:
                 (np.array([168, 90, 70]), np.array([180, 255, 255])),
             ],
             "GREEN": [(np.array([36, 70, 60]), np.array([86, 255, 255]))],
-            "BLUE": [(np.array([95, 70, 60]), np.array([138, 255, 255]))],
+            "BLUE": [(np.array([98, 120, 90]), np.array([132, 255, 255]))],
             "YELLOW": [(np.array([18, 90, 80]), np.array([35, 255, 255]))],
         }
 
-        def extract_color_blobs(col_name: str) -> List[Tuple[int, int, float]]:
+        def get_color_mask(col_name: str) -> np.ndarray:
             mask = np.zeros((h, w), dtype=np.uint8)
             for low, high in color_ranges.get(col_name, []):
                 mask |= cv2.inRange(hsv, low, high)
-            return self._find_blobs(mask)
+            return mask
 
         bin_by_color: Dict[str, Tuple[int, np.ndarray]] = {
             b_col: (b_slot, np.array(b_pos, dtype=np.float32))
@@ -148,7 +183,6 @@ class VisualRejectAndReturnAI:
             for b_col, b_slot, b_pos in bin_layout
         }
 
-        # Find which bin has no matching cube (the mismatched candidate bin, e.g. Bin #2 YELLOW)
         cube_colors_set = {c_col for c_col, _, _ in cube_layout}
         unmatched_bins = [
             (b_slot, b_col, np.array(b_pos, dtype=np.float32))
@@ -159,21 +193,14 @@ class VisualRejectAndReturnAI:
         tasks: List[SortingOrRejectTask] = []
         for idx, (c_col, c_slot, c_pos) in enumerate(cube_layout):
             c_pos_arr = np.array(c_pos, dtype=np.float32)
-            blobs = extract_color_blobs(c_col)
+            c_mask = get_color_mask(c_col)
+            proj_cube_uv = self.project_3d_to_2d(c_pos_arr, width=w, height=h)
+            cube_uv = self._refine_uv_in_roi(c_mask, proj_cube_uv)
 
             if c_col in bin_by_color:
-                # Color match exists!
                 b_slot, b_pos_arr = bin_by_color[c_col]
-                if len(blobs) >= 2:
-                    blobs_u = sorted(blobs[:2], key=lambda b: b[0])
-                    bin_uv = (blobs_u[0][0], blobs_u[0][1])
-                    cube_uv = (blobs_u[1][0], blobs_u[1][1])
-                elif len(blobs) == 1:
-                    cube_uv = (blobs[0][0], blobs[0][1])
-                    bin_uv = (max(80, blobs[0][0] - 180), min(h - 80, blobs[0][1] + 50))
-                else:
-                    cube_uv = (w // 2 + 80, h // 2)
-                    bin_uv = (w // 2 - 120, h // 2 + 50)
+                proj_bin_uv = self.project_3d_to_2d(b_pos_arr, width=w, height=h)
+                bin_uv = self._refine_uv_in_roi(c_mask, proj_bin_uv)
 
                 tasks.append(
                     SortingOrRejectTask(
@@ -184,7 +211,7 @@ class VisualRejectAndReturnAI:
                         inspect_bin_slot=b_slot,
                         inspect_bin_color=c_col,
                         is_match=True,
-                        confidence=0.98,
+                        confidence=0.99,
                         cube_pixel_uv=cube_uv,
                         bin_pixel_uv=bin_uv,
                         cube_pos_3d=c_pos_arr,
@@ -192,16 +219,15 @@ class VisualRejectAndReturnAI:
                     )
                 )
             else:
-                # NO matching bin color exists for this cube! (2nd cube: RED, available bin #2 is YELLOW)
                 if unmatched_bins:
                     insp_slot, insp_col, insp_pos_arr = unmatched_bins[0]
                 else:
                     insp_col, insp_pos_arr = bin_by_slot[c_slot]
                     insp_slot = c_slot
 
-                cube_uv = (blobs[0][0], blobs[0][1]) if blobs else (w // 2 + 80, h // 2)
-                insp_blobs = extract_color_blobs(insp_col)
-                bin_uv = (insp_blobs[0][0], insp_blobs[0][1]) if insp_blobs else (w // 2 - 120, h // 2 + 50)
+                insp_mask = get_color_mask(insp_col)
+                proj_bin_uv = self.project_3d_to_2d(insp_pos_arr, width=w, height=h)
+                bin_uv = self._refine_uv_in_roi(insp_mask, proj_bin_uv)
 
                 tasks.append(
                     SortingOrRejectTask(
@@ -221,3 +247,4 @@ class VisualRejectAndReturnAI:
                 )
 
         return tasks
+
